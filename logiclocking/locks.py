@@ -6,47 +6,6 @@ from random import choice, choices, randint, sample, shuffle
 import circuitgraph as cg
 import re
 
-# gate: 元のゲート cl: コピーしたゲート
-def replace_lut(gate, cl, key_prefix, num_locked_gates):
-    key = {}
-    m = cg.logic.mux(2 ** len(cl.fanin(gate)))
-    fanout = list(cl.fanout(gate))
-    fanin = list(cl.fanin(gate))
-
-    # create LUT
-    cl.add_subcircuit(m, f"lut_{gate}")
-
-    # create subcircuit containing just gate for simulation
-    simc = cg.Circuit()
-    for i in fanin:
-        simc.add(i, "input")
-    simc.add(gate, cl.type(gate), fanin=fanin)
-
-    # connect keys
-    for i, vs in enumerate(product([False, True], repeat=len(fanin))):
-        assumptions = dict(zip(fanin, vs[::-1]))
-        cl.add(
-            f"{key_prefix}{num_locked_gates:04}{i:02}",
-            "input",
-            fanout=f"lut_{gate}_in_{i}",
-        )
-        result = cg.sat.solve(simc, assumptions)
-        if not result:
-            key[f"{key_prefix}{num_locked_gates:04}{i:02}"] = False
-        else:
-            key[f"{key_prefix}{num_locked_gates:04}{i:02}"] = result[gate]
-
-    # connect out
-    cl.disconnect(gate, fanout)
-    cl.connect(f"lut_{gate}_out", fanout)
-
-    # connect sel
-    for i, f in enumerate(fanin):
-        cl.connect(f, f"lut_{gate}_sel_{i}")
-
-    # delete gate
-    cl.remove(gate)
-    return key, [f"lut_{gate}_{n}" for n in m.nodes()], f"lut_{gate}_out"
 
 def inputs_in_fanincone(c, gate):
     inputs = c.inputs()
@@ -56,19 +15,21 @@ def inputs_in_fanincone(c, gate):
 
 
 def delete_lut_gates_in_path(c, path):
-    path_with_modularized_lut = []
+    path_without_lut = [] # もとはpath_with_modularized_lutという名前だった
+    # 名前が"mux"で始まるゲートを除外
+    # lutは内部的にはmuxを使って実装されている
     for gate in path:
         match = re.match("mux", gate)
         if not match:
-            path_with_modularized_lut.append(gate)
-    return tuple(path_with_modularized_lut)
+            path_without_lut.append(gate)
+    return tuple(path_without_lut)
 
 
 def delete_lut_gates_in_paths(c, paths):
-    paths_with_modularized_lut = set()
+    paths_without_lut = set() # setにすることで重複しているパスを削除
     for path in paths:
-        paths_with_modularized_lut.add(delete_lut_gates_in_path(c, path))
-    return list(paths_with_modularized_lut)
+        paths_without_lut.add(delete_lut_gates_in_path(c, path))
+    return list(paths_without_lut)
 
 
 def calc_longest_path(c, start, end):
@@ -234,7 +195,7 @@ def loop_lock(c, num_loops, length_loops, end_gates, key_prefix="key_"):
         count += 1
     return cl
 
-# FIFO
+# こちらは使われていない（定義されているだけ）
 def fan_in_out_lock(c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"):
     """
 
@@ -377,7 +338,7 @@ def fan_in_out_lock(c, num_gates, count_keys=False, skip_fi1=False, key_prefix="
 
     return cl, keys
 
-# 出力ゲートのみを対象とするアルゴリズムにする予定だった？
+# これをFIFOとして使っている
 def fan_in_out_lock_output(
     c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
 ):
@@ -555,9 +516,7 @@ def fan_in_out_lock_output(
                     if cl.is_output(fanout_gate):
                         fanout_po_list.add(fanout_gate)  # get all the po in fanoutcone
 
-                if (
-                    fanout_po_list <= replaced_positions
-                ):  # if all the po in fanoutcone are replaced
+                if (fanout_po_list <= replaced_positions):  # if all the po in fanoutcone are replaced
                     candidates.append(gate)
                     # print(gate)
     return cl, keys, locked_list
@@ -623,6 +582,190 @@ def fan_in_out_loop_lock_output(c, num_gates, num_loops, length_loops, count_key
 
     return cl, c_loop_only, locked_list
 
+# 1出力あたりの最大値関数に制限を設ける
+def fan_in_out_lock_limit_output(
+    c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
+):
+    """
+
+    Parameters
+    ----------
+    circuit: circuitgraph.CircuitGraph
+            Circuit to lock.
+    num_gates: int
+            The number of gates to lock.
+    count_keys: bool
+            If true, continue locking until at least `num_gates` keys are
+            added instead of `num_gates` gates.
+    skip_fi1: int
+            If True, nodes with a fanin of 1 (i.e. buf or inv) will not
+            be considered for locking.
+    key_prefix: string
+            prefix for key
+    Returns
+    -------
+    circuitgraph.CircuitGraph, dict of str:bool
+            the locked circuit and the correct key value for each key input
+
+    """
+
+    cl = c.copy()
+    pos = list(cl.outputs())
+
+    def replace_lut(gate, cl):
+        key = {}
+        m = cg.logic.mux(2 ** len(cl.fanin(gate)))
+        fanout = list(cl.fanout(gate))
+        fanin = list(cl.fanin(gate))
+
+        # create LUT
+        cl.add_subcircuit(m, f"lut_{gate}")
+
+        # create subcircuit containing just gate for simulation
+        simc = cg.Circuit()
+        for i in fanin:
+            simc.add(i, "input")
+        simc.add(gate, cl.type(gate), fanin=fanin)
+
+        # connect keys
+        for i, vs in enumerate(product([False, True], repeat=len(fanin))):
+            assumptions = dict(zip(fanin, vs[::-1]))
+            cl.add(
+                f"{key_prefix}{locked_gates:04}{i:02}",
+                "input",
+                fanout=f"lut_{gate}_in_{i}",
+            )
+            result = cg.sat.solve(simc, assumptions)
+            if not result:
+                key[f"{key_prefix}{locked_gates:04}{i:02}"] = False
+            else:
+                key[f"{key_prefix}{locked_gates:04}{i:02}"] = result[gate]
+
+        # connect out
+        cl.disconnect(gate, fanout)
+        cl.connect(f"lut_{gate}_out", fanout)
+
+        # connect sel
+        for i, f in enumerate(fanin):
+            cl.connect(f, f"lut_{gate}_sel_{i}")
+
+        # delete gate
+        cl.remove(gate)
+        # print(gate)
+        # print(key)
+        return key, [f"lut_{gate}_{n}" for n in m.nodes()], f"lut_{gate}_out"
+
+    def calc_skew(gate, cl):
+        d = {False: 0, True: 0}
+        fanin = list(cl.fanin(gate))
+
+        # create subcircuit containing just gate for simulation
+        simc = cg.Circuit()
+        for i in fanin:
+            simc.add(i, "input")
+        simc.add(gate, cl.type(gate), fanin=fanin)
+
+        # simulate
+        for i, vs in enumerate(product([False, True], repeat=len(fanin))):
+            assumptions = dict(zip(fanin, vs[::-1]))
+            result = cg.sat.solve(simc, assumptions)
+            if not result:
+                d[False] += 1
+            else:
+                d[result[gate]] += 1
+        num_combos = 2 ** len(fanin)
+        return abs(d[False] / num_combos - d[True] / num_combos)
+
+    def continue_locking(locked_gates, num_gates, keys, count_keys):
+        if count_keys:
+            return len(keys) < num_gates
+        return locked_gates < num_gates
+
+    def rank_output(x):
+        # print(x,len(cl.transitive_fanin(x)))
+        return len(cl.transitive_fanin(x))
+
+    # sort pos on fanincone in descending order
+    pos.sort(key=rank_output, reverse=True)
+
+    keys = {}
+    candidates = []
+    forbidden_nodes = set()
+    replaced_positions = set()
+    locked_gates = 0
+    locked_list = []
+
+    while continue_locking(locked_gates, num_gates, keys, count_keys):
+        if not candidates:
+            pos = [o for o in pos if o not in forbidden_nodes]
+            try:
+                candidates.append(
+                    pos.pop(0)
+                )  # if we run out of candidates add another po
+            except IndexError as e:
+                raise ValueError(
+                    "Ran out of candidate gates at " f"{locked_gates} gates."
+                ) from e
+        else:
+            candidate = candidates.pop(0)
+            children = cl.fanin(candidate)
+
+            # skip forbidden nodes
+            if candidate in forbidden_nodes:
+                continue
+
+            # skip buf/not (optional)
+            if skip_fi1 and len(children) == 1:
+                forbidden_nodes.add(candidate)
+                continue
+
+            forbidden_nodes.add(candidate)
+            candidate_is_output = cl.is_output(candidate)
+            replaced_positions.add(candidate)
+            fanin_cone = c.transitive_fanin(candidate)  # c or cl?
+
+            # do the replacment
+            key, nodes, output_to_relabel = replace_lut(candidate, cl)
+            keys.update(key)
+            cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
+            if candidate_is_output:
+                cl.set_output(candidate)
+            locked_gates += 1
+            locked_list.append(candidate)
+
+            fanin_cone = list(fanin_cone)
+
+            # randomize fanincone list, disable for testing the folowing plan
+            # random.shuffle(fanin_cone)
+
+            # plan1 sort on min_impact and then skew
+            """
+            fanin_cone.sort(
+                key=lambda x: (
+                     len(cl.transitive_fanout(x) & cl.outputs()),
+                     -calc_skew(x, cl),
+               )
+            )
+            """
+
+            # plan2 PO distance
+
+            # fanin_cone.sort(key=lambda x: (cl.fanout_depth(x)))
+
+            # add replaceable fanincone into candidates
+            for gate in fanin_cone:
+                fanout_po_list = set()
+
+                for fanout_gate in c.transitive_fanout(gate):  # c or cl?
+                    if cl.is_output(fanout_gate):
+                        fanout_po_list.add(fanout_gate)  # get all the po in fanoutcone
+
+                if (fanout_po_list <= replaced_positions):  # if all the po in fanoutcone are replaced
+                    candidates.append(gate)
+                    # print(gate)
+    return cl, keys, locked_list
+
+########## 研究のために追加したコードはここまで ##########
 
 
 def trll(c, keylen, s1_s2_ratio=1, shuffle_key=True, seed=None):
