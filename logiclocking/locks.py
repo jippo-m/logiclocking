@@ -181,6 +181,14 @@ def loop_lock(c, num_loops, length_loops, end_gates, key_prefix="key_"):
         count += 1
     return cl
 
+# 置換することにより保護できている出力のリストを返す
+def get_affected_outputs(c, locked_gates) -> list:
+    affected_outputs = set()
+    for gate in locked_gates:
+        for output in c.transitive_fanout(gate):
+            if c.is_output(output):
+                affected_outputs.add(output)
+    return list(affected_outputs)
 
 # Fan In Fan Out Lock (FIFO Lock)
 def FIFO_lock(
@@ -211,6 +219,7 @@ def FIFO_lock(
 
     cl = c.copy()
     pos = list(cl.outputs())
+    # print(f"There are {len(pos)} outputs in the circuit.") # ibex_decoder については269個だった
 
     def replace_lut(gate, cl):
         key = {}
@@ -363,7 +372,8 @@ def FIFO_lock(
                 if (fanout_po_list <= replaced_positions):  # if all the po in fanoutcone are replaced
                     candidates.append(gate)
                     # print(gate)
-    return cl, keys, locked_list
+        affected_outputs = get_affected_outputs(c, locked_list)
+    return cl, keys, locked_list, affected_outputs
 
 # FIFO Lock with Loop
 def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1=False, key_prefix="key_"):
@@ -410,7 +420,7 @@ def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1
         return key, [f"lut_{gate}_{n}" for n in m.nodes()], f"lut_{gate}_out"
 
     # まずはFIFOのみ実行し、LUTに置換する論理ゲート（locked_list）を把握
-    _, _, locked_list = FIFO_lock(c, num_gates, count_keys, skip_fi1, key_prefix)
+    _, _, locked_list, _ = FIFO_lock(c, num_gates, count_keys, skip_fi1, key_prefix)
     # LUTに置換する場所をフィードバック起点 (end_gates) としてループを作る
     c_loop_only = loop_lock(c, num_loops, length_loops, locked_list, key_prefix)
 
@@ -425,8 +435,9 @@ def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1
         # print(locked_gate, locked_gates)
         # print(key)
         locked_gates += 1
-
-    return cl, c_loop_only, locked_list
+    
+    affected_outputs = get_affected_outputs(c, locked_list)
+    return cl, c_loop_only, locked_list, affected_outputs
 
 # 1出力あたりの最大置換数に制限を設ける + NB2
 def fan_in_out_lock_limit_output(
@@ -1167,7 +1178,8 @@ def lut_lock(
             )
             locked_gates += 1
 
-    return cl, keys, locked_list
+    affected_outputs = get_affected_outputs(c, locked_list)
+    return cl, keys, locked_list, affected_outputs
 
 
 def tt_lock(c, width, target_output=None):
