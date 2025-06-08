@@ -223,14 +223,23 @@ def loop_lock(c, num_loops, length_loops, end_gates, key_prefix="key_"):
         count += 1
     return cl
 
-# 置換することにより保護できている出力の集合を返す
+# 置換することにより保護できる出力の集合を返す
 def get_affected_outputs(c, locked_gates_list: list[str]) -> set[str]:
     affected_outputs = set()
-    for gate in locked_gates_list:
-        for output in c.transitive_fanout(gate):
-            if c.is_output(output):
-                affected_outputs.add(output)
+    for replaced_gate in locked_gates_list:
+        for gate in c.transitive_fanout(replaced_gate):
+            if c.is_output(gate):
+                affected_outputs.add(gate)
     return affected_outputs
+
+# 引数のゲートに影響を与えている入力の集合を返す
+def get_affecting_inputs(c, locked_gates_list: list[str]) -> set[str]:
+    affected_inputs = set()
+    for replaced_gate in locked_gates_list:
+        for gate in c.transitive_fanin(replaced_gate):
+            if c.is_input(gate):
+                affected_inputs.add(gate)
+    return affected_inputs
 
 ######################################################
 # 実際のロック処理を行う関数群
@@ -313,6 +322,7 @@ def FIFO_lock(
                 new_po = pos.pop(0)
                 candidates.append(new_po)
                 affected_outputs.add(new_po)  # add the new po to affected outputs
+                affected_outputs |= c.transitive_fanout(new_po)  # add all the outputs in fanoutcone
 
                 # add replaceable fanincone into candidates
                 for gate in c.transitive_fanin(new_po): # c or cl?
@@ -321,6 +331,7 @@ def FIFO_lock(
                     fanout_po_list = get_affected_outputs(c, [gate])  # get all the po in fanoutcone
                     if (fanout_po_list <= affected_outputs):  # if all the po in fanoutcone are replaced
                         candidates.append(gate)
+
             except IndexError as e:
                 raise ValueError(
                     "Ran out of candidate gates at " f"{locked_gates} gates."
@@ -339,7 +350,6 @@ def FIFO_lock(
                 continue
 
             # do the replacment
-            forbidden_nodes.add(candidate)
             key, nodes, output_to_relabel = replace_lut(candidate, cl, locked_gates, key_prefix)
             keys.update(key)
             cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
@@ -347,6 +357,7 @@ def FIFO_lock(
                 cl.set_output(candidate)
             locked_gates += 1
             locked_list.append(candidate)
+            forbidden_nodes.add(candidate)
 
         # affected_outputs = get_affected_outputs(c, locked_list)
     return cl, keys, locked_list, affected_outputs
@@ -374,181 +385,15 @@ def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1
     affected_outputs = get_affected_outputs(c, locked_list)
     return cl, c_loop_only, locked_list, affected_outputs
 
-# 1出力あたりの最大置換数に制限を設ける + NB2
-def fan_in_out_lock_limit_output(
-    c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
-):
-    """
-
-    Parameters
-    ----------
-    circuit: circuitgraph.CircuitGraph
-            Circuit to lock.
-    num_gates: int
-            The number of gates to lock.
-    count_keys: bool
-            If true, continue locking until at least `num_gates` keys are
-            added instead of `num_gates` gates.
-    skip_fi1: int
-            If True, nodes with a fanin of 1 (i.e. buf or inv) will not
-            be considered for locking.
-    key_prefix: string
-            prefix for key
-    Returns
-    -------
-    circuitgraph.CircuitGraph, dict of str:bool
-            the locked circuit and the correct key value for each key input
-
-    """
-
-    cl = c.copy()
-    pos = list(cl.outputs())
-
-    def calc_skew(gate, cl):
-        d = {False: 0, True: 0}
-        fanin = list(cl.fanin(gate))
-
-        # create subcircuit containing just gate for simulation
-        simc = cg.Circuit()
-        for i in fanin:
-            simc.add(i, "input")
-        simc.add(gate, cl.type(gate), fanin=fanin)
-
-        # simulate
-        for i, vs in enumerate(product([False, True], repeat=len(fanin))):
-            assumptions = dict(zip(fanin, vs[::-1]))
-            result = cg.sat.solve(simc, assumptions)
-            if not result:
-                d[False] += 1
-            else:
-                d[result[gate]] += 1
-        num_combos = 2 ** len(fanin)
-        return abs(d[False] / num_combos - d[True] / num_combos)
-
-    def continue_locking(locked_gates, num_gates, keys, count_keys):
-        if count_keys:
-            return len(keys) < num_gates
-        return locked_gates < num_gates
-
-    def rank_output(x):
-        # print(x,len(cl.transitive_fanin(x)))
-        return len(cl.transitive_fanin(x))
-
-    # sort pos on fanincone in descending order
-    pos.sort(key=rank_output, reverse=True)
-
-    keys = {}
-    candidates = []
-    forbidden_nodes = set()
-    replaced_positions = set()
-    locked_gates = 0
-    locked_list = []
-
-    # 置換数制限のための辞書
-    # output_replace_count = {o: 0 for o in cl.outputs()}
-    # max_replacements_per_output = 15
-    # NB2
-    nb2_skip = set()
-
-    while continue_locking(locked_gates, num_gates, keys, count_keys):
-        if not candidates:
-            pos = [o for o in pos if o not in forbidden_nodes]
-            try:
-                candidates.append(
-                    pos.pop(0)
-                )  # if we run out of candidates add another po
-            except IndexError as e:
-                raise ValueError(
-                    "Ran out of candidate gates at " f"{locked_gates} gates."
-                ) from e
-        else:
-            candidate = candidates.pop(0)
-            children = cl.fanin(candidate)
-
-            # skip forbidden nodes
-            if candidate in forbidden_nodes:
-                continue
-
-            # skip buf/not (optional)
-            if skip_fi1 and len(children) == 1:
-                forbidden_nodes.add(candidate)
-                continue
-
-            # NB2 skip check
-            if candidate in nb2_skip:
-                continue
-
-            # --- NEW: skip if PO already over limit ---
-            # fanout_pos = set() # candidateのfanoutに含まれる出力を格納
-            # for fanout in cl.transitive_fanout(candidate):
-            #     if cl.is_output(fanout):
-            #         fanout_pos.add(fanout)
-
-            # 出力ごとに制限を超えているならスキップ
-            # if any(output_replace_count[o] >= max_replacements_per_output for o in fanout_pos):
-            #     continue
-
-            forbidden_nodes.add(candidate)
-            candidate_is_output = cl.is_output(candidate)
-            replaced_positions.add(candidate)
-            fanin_cone = c.transitive_fanin(candidate)  # c or cl?
-            fanin_of_candidate = list(cl.fanin(candidate))
-
-            # do the replacment
-            key, nodes, output_to_relabel = replace_lut(candidate, cl)
-            keys.update(key)
-
-            # NB2
-            nb2_skip.update(fanin_of_candidate)  # add fanin to skip list
-
-            # --- NEW: increment PO replace count ---
-            # for o in fanout_pos:
-            #     output_replace_count[o] += 1
-
-            cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
-            if candidate_is_output:
-                cl.set_output(candidate)
-            locked_gates += 1
-            locked_list.append(candidate)
-
-            fanin_cone = list(fanin_cone)
-
-            # randomize fanincone list, disable for testing the folowing plan
-            # random.shuffle(fanin_cone)
-
-            # plan1 sort on min_impact and then skew
-            """
-            fanin_cone.sort(
-                key=lambda x: (
-                     len(cl.transitive_fanout(x) & cl.outputs()),
-                     -calc_skew(x, cl),
-               )
-            )
-            """
-
-            # plan2 PO distance
-
-            # fanin_cone.sort(key=lambda x: (cl.fanout_depth(x)))
-
-            # add replaceable fanincone into candidates
-            for gate in fanin_cone:
-                fanout_po_list = set()
-
-                for fanout_gate in c.transitive_fanout(gate):  # c or cl?
-                    if cl.is_output(fanout_gate):
-                        fanout_po_list.add(fanout_gate)  # get all the po in fanoutcone
-
-                if (fanout_po_list <= replaced_positions):  # if all the po in fanoutcone are replaced
-                    candidates.append(gate)
-                    # print(gate)
-    return cl, keys, locked_list
 
 # 広い範囲の出力に影響を与えるように置換する wide scope output = WSO, High Corruptibility LUT Loop Lock = HC-LLL
-def WSO_lock(
+def HCLL(
     c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
 ):
     cl = c.copy()
-    pos = list(cl.outputs())
+    pos = list(c.outputs())
+    pis = list(c.inputs())
+    # print(f"There are {len(pis)} inputs in the circuit.") # ibex_decoder については69個だった
     # print(f"There are {len(pos)} outputs in the circuit.") # ibex_decoder については269個だった
 
     def calc_skew(gate, cl):
@@ -577,12 +422,10 @@ def WSO_lock(
             return len(keys) < num_gates
         return locked_gates < num_gates
 
-    def rank_output(x):
-        return len(cl.transitive_fanin(x))
+    def rank_gate_by_affected_outputs(gate):
+        return len(get_affected_outputs(c, [gate]))
 
-    # sort pos on fanincone in descending order
-    pos.sort(key=rank_output, reverse=True)
-
+    pis.sort(key=rank_gate_by_affected_outputs, reverse=True)
     keys = {}
     candidates = []
     forbidden_nodes = set()
@@ -590,25 +433,23 @@ def WSO_lock(
     locked_list = []
     affected_outputs = set()
 
-    while continue_locking(locked_gates, num_gates, keys, count_keys):
-        if not candidates: # ファンインコーンを探索し終わったら次のpoを追加
-            pos = [o for o in pos if o not in forbidden_nodes]
-            try:
-                new_po = pos.pop(0)
-                candidates.append(new_po)
-                affected_outputs.add(new_po)  # add the new po to affected outputs
+    for pi in pis:
+        # add replaceable fanout into candidates
+        current_pi_fanout_gates = set()
+        for gate in c.fanout(pi): # c or cl?
+            if gate in forbidden_nodes:  # skip forbidden nodes
+                continue
+            current_pi_fanout_gates.add(gate)
 
-                # add replaceable fanincone into candidates
-                for gate in c.transitive_fanin(new_po): # c or cl?
-                    if gate in forbidden_nodes:  # skip forbidden nodes
-                        continue
-                    fanout_po_list = get_affected_outputs(c, [gate])  # get all the po in fanoutcone
-                    if (fanout_po_list <= affected_outputs):  # if all the po in fanoutcone are replaced
-                        candidates.append(gate)
-            except IndexError as e:
-                raise ValueError(
-                    "Ran out of candidate gates at " f"{locked_gates} gates."
-                ) from e
+        current_pi_fanout_gates = list(current_pi_fanout_gates)
+        current_pi_fanout_gates.sort(key=rank_gate_by_affected_outputs, reverse=True)
+        for gate in current_pi_fanout_gates:
+            candidates.insert(0, gate)
+
+    while continue_locking(locked_gates, num_gates, keys, count_keys):
+        if not candidates:
+            print("\033[31m" + "No more candidates left." + "\033[0m")
+            exit(1)
             
         else: # ファンインコーン探索中
             candidate = candidates.pop(0)
@@ -623,22 +464,27 @@ def WSO_lock(
                 continue
 
             # do the replacment
-            forbidden_nodes.add(candidate)
             key, nodes, output_to_relabel = replace_lut(candidate, cl, locked_gates, key_prefix)
             keys.update(key)
             cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
-            if c.is_output(candidate):
-                cl.set_output(candidate)
             locked_gates += 1
             locked_list.append(candidate)
+            forbidden_nodes.add(candidate)
 
-        # affected_outputs = get_affected_outputs(c, locked_list)
+            # NB2: Not-Back-to-Back
+            for gate in c.fanout(candidate):
+                for NB2_gate in c.fanout(gate):
+                    if NB2_gate not in forbidden_nodes:
+                        candidates.append(NB2_gate)
+                        candidates = list(set(candidates))  # 重複を削除
+
+        affected_outputs = get_affected_outputs(c, locked_list)
     return cl, keys, locked_list, affected_outputs
 
-def LLL(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1=False, key_prefix="key_"):
+def HCLLL(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1=False, key_prefix="key_"):
 
     # まずはFIFOのみ実行し、LUTに置換する論理ゲート（locked_list）を把握
-    _, _, locked_list, _ = WSO_lock(c, num_gates, count_keys, skip_fi1, key_prefix)
+    _, _, locked_list, _ = HCLL(c, num_gates, count_keys, skip_fi1, key_prefix)
     # LUTに置換する場所をフィードバック起点 (end_gates) としてループを作る
     c_loop_only = loop_lock(c, num_loops, length_loops, locked_list, key_prefix)
 
