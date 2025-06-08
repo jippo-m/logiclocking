@@ -6,6 +6,48 @@ from random import choice, choices, randint, sample, shuffle
 import circuitgraph as cg
 import re
 
+def replace_lut(gate: str, cl, locked_gates: int, key_prefix: str) -> tuple[dict, list, str]:
+    key = {}
+    m = cg.logic.mux(2 ** len(cl.fanin(gate)))
+    fanout = list(cl.fanout(gate))
+    fanin = list(cl.fanin(gate))
+
+    # create LUT
+    cl.add_subcircuit(m, f"lut_{gate}")
+
+    # create subcircuit containing just gate for simulation
+    simc = cg.Circuit()
+    for i in fanin:
+        simc.add(i, "input")
+    simc.add(gate, cl.type(gate), fanin=fanin)
+
+    # connect keys
+    for i, vs in enumerate(product([False, True], repeat=len(fanin))):
+        assumptions = dict(zip(fanin, vs[::-1]))
+        cl.add(
+            f"{key_prefix}{locked_gates:04}{i:02}",
+            "input",
+            fanout=f"lut_{gate}_in_{i}",
+        )
+        result = cg.sat.solve(simc, assumptions)
+        if not result:
+            key[f"{key_prefix}{locked_gates:04}{i:02}"] = False
+        else:
+            key[f"{key_prefix}{locked_gates:04}{i:02}"] = result[gate]
+
+    # connect out
+    cl.disconnect(gate, fanout)
+    cl.connect(f"lut_{gate}_out", fanout)
+
+    # connect sel
+    for i, f in enumerate(fanin):
+        cl.connect(f, f"lut_{gate}_sel_{i}")
+
+    # delete gate
+    cl.remove(gate)
+    # print(gate)
+    # print(key)
+    return key, [f"lut_{gate}_{n}" for n in m.nodes()], f"lut_{gate}_out"
 
 def inputs_in_fanincone(c, gate):
     inputs = c.inputs()
@@ -182,7 +224,7 @@ def loop_lock(c, num_loops, length_loops, end_gates, key_prefix="key_"):
     return cl
 
 # 置換することにより保護できている出力のリストを返す
-def get_affected_outputs(c, locked_gates) -> list:
+def get_affected_outputs(c, locked_gates: list[str]) -> list[str]:
     affected_outputs = set()
     for gate in locked_gates:
         for output in c.transitive_fanout(gate):
@@ -224,49 +266,6 @@ def FIFO_lock(
     cl = c.copy()
     pos = list(cl.outputs())
     # print(f"There are {len(pos)} outputs in the circuit.") # ibex_decoder については269個だった
-
-    def replace_lut(gate, cl):
-        key = {}
-        m = cg.logic.mux(2 ** len(cl.fanin(gate)))
-        fanout = list(cl.fanout(gate))
-        fanin = list(cl.fanin(gate))
-
-        # create LUT
-        cl.add_subcircuit(m, f"lut_{gate}")
-
-        # create subcircuit containing just gate for simulation
-        simc = cg.Circuit()
-        for i in fanin:
-            simc.add(i, "input")
-        simc.add(gate, cl.type(gate), fanin=fanin)
-
-        # connect keys
-        for i, vs in enumerate(product([False, True], repeat=len(fanin))):
-            assumptions = dict(zip(fanin, vs[::-1]))
-            cl.add(
-                f"{key_prefix}{locked_gates:04}{i:02}",
-                "input",
-                fanout=f"lut_{gate}_in_{i}",
-            )
-            result = cg.sat.solve(simc, assumptions)
-            if not result:
-                key[f"{key_prefix}{locked_gates:04}{i:02}"] = False
-            else:
-                key[f"{key_prefix}{locked_gates:04}{i:02}"] = result[gate]
-
-        # connect out
-        cl.disconnect(gate, fanout)
-        cl.connect(f"lut_{gate}_out", fanout)
-
-        # connect sel
-        for i, f in enumerate(fanin):
-            cl.connect(f, f"lut_{gate}_sel_{i}")
-
-        # delete gate
-        cl.remove(gate)
-        # print(gate)
-        # print(key)
-        return key, [f"lut_{gate}_{n}" for n in m.nodes()], f"lut_{gate}_out"
 
     def calc_skew(gate, cl):
         d = {False: 0, True: 0}
@@ -338,7 +337,7 @@ def FIFO_lock(
             fanin_cone = c.transitive_fanin(candidate)  # c or cl?
 
             # do the replacment
-            key, nodes, output_to_relabel = replace_lut(candidate, cl)
+            key, nodes, output_to_relabel = replace_lut(candidate, cl, locked_gates, key_prefix)
             keys.update(key)
             cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
             if candidate_is_output:
@@ -382,47 +381,6 @@ def FIFO_lock(
 # FIFO Lock with Loop
 def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1=False, key_prefix="key_"):
 
-    def replace_lut(gate, cl):
-        key = {}
-        m = cg.logic.mux(2 ** len(cl.fanin(gate)))
-        fanout = list(cl.fanout(gate))
-        fanin = list(cl.fanin(gate))
-
-        # create LUT
-        cl.add_subcircuit(m, f"lut_{gate}")
-
-        # create subcircuit containing just gate for simulation
-        simc = cg.Circuit()
-        for i in fanin:
-            simc.add(i, "input")
-        simc.add(gate, cl.type(gate), fanin=fanin)
-
-        # connect keys
-        for i, vs in enumerate(product([False, True], repeat=len(fanin))):
-            assumptions = dict(zip(fanin, vs[::-1]))
-            cl.add(
-                f"{key_prefix}{locked_gates:04}{i:02}",
-                "input",
-                fanout=f"lut_{gate}_in_{i}",
-            )
-            result = cg.sat.solve(simc, assumptions)
-            if not result:
-                key[f"{key_prefix}{locked_gates:04}{i:02}"] = False
-            else:
-                key[f"{key_prefix}{locked_gates:04}{i:02}"] = result[gate]
-
-        # connect out
-        cl.disconnect(gate, fanout)
-        cl.connect(f"lut_{gate}_out", fanout)
-
-        # connect sel
-        for i, f in enumerate(fanin):
-            cl.connect(f, f"lut_{gate}_sel_{i}")
-
-        # delete gate
-        cl.remove(gate)
-        return key, [f"lut_{gate}_{n}" for n in m.nodes()], f"lut_{gate}_out"
-
     # まずはFIFOのみ実行し、LUTに置換する論理ゲート（locked_list）を把握
     _, _, locked_list, _ = FIFO_lock(c, num_gates, count_keys, skip_fi1, key_prefix)
     # LUTに置換する場所をフィードバック起点 (end_gates) としてループを作る
@@ -432,7 +390,7 @@ def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1
     locked_gates = 0
     for locked_gate in locked_list:
         locked_gate_is_output = c.is_output(locked_gate)
-        key, nodes, output_to_relabel = replace_lut(locked_gate, cl)
+        key, nodes, output_to_relabel = replace_lut(locked_gate, cl, locked_gates, key_prefix)
         cl = cg.tx.relabel(cl, {output_to_relabel: locked_gate})
         if locked_gate_is_output:
             cl.set_output(locked_gate)
@@ -655,56 +613,13 @@ def fan_in_out_lock_limit_output(
                     # print(gate)
     return cl, keys, locked_list
 
-# 広い範囲の出力に影響を与えるように置換する wide scope output = WSO
+# 広い範囲の出力に影響を与えるように置換する wide scope output = WSO, High Corruptibility LUT Loop Lock = HC-LLL
 def WSO_lock(
     c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
 ):
     cl = c.copy()
     pos = list(cl.outputs())
     # print(f"There are {len(pos)} outputs in the circuit.") # ibex_decoder については269個だった
-
-    def replace_lut(gate, cl):
-        key = {}
-        m = cg.logic.mux(2 ** len(cl.fanin(gate)))
-        fanout = list(cl.fanout(gate))
-        fanin = list(cl.fanin(gate))
-
-        # create LUT
-        cl.add_subcircuit(m, f"lut_{gate}")
-
-        # create subcircuit containing just gate for simulation
-        simc = cg.Circuit()
-        for i in fanin:
-            simc.add(i, "input")
-        simc.add(gate, cl.type(gate), fanin=fanin)
-
-        # connect keys
-        for i, vs in enumerate(product([False, True], repeat=len(fanin))):
-            assumptions = dict(zip(fanin, vs[::-1]))
-            cl.add(
-                f"{key_prefix}{locked_gates:04}{i:02}",
-                "input",
-                fanout=f"lut_{gate}_in_{i}",
-            )
-            result = cg.sat.solve(simc, assumptions)
-            if not result:
-                key[f"{key_prefix}{locked_gates:04}{i:02}"] = False
-            else:
-                key[f"{key_prefix}{locked_gates:04}{i:02}"] = result[gate]
-
-        # connect out
-        cl.disconnect(gate, fanout)
-        cl.connect(f"lut_{gate}_out", fanout)
-
-        # connect sel
-        for i, f in enumerate(fanin):
-            cl.connect(f, f"lut_{gate}_sel_{i}")
-
-        # delete gate
-        cl.remove(gate)
-        # print(gate)
-        # print(key)
-        return key, [f"lut_{gate}_{n}" for n in m.nodes()], f"lut_{gate}_out"
 
     def calc_skew(gate, cl):
         d = {False: 0, True: 0}
@@ -733,8 +648,9 @@ def WSO_lock(
         return locked_gates < num_gates
 
     def rank_output(x):
-        # print(x,len(cl.transitive_fanin(x)))
-        return len(cl.transitive_fanin(x))
+        # print(x,len(get_affected_outputs(c, [x])))
+        # return len(get_affected_outputs(c, [x]))
+        return len(c.transitive_fanin(x))
 
     # sort pos on fanincone in descending order
     pos.sort(key=rank_output, reverse=True)
@@ -769,7 +685,10 @@ def WSO_lock(
             if skip_fi1 and len(children) == 1:
                 forbidden_nodes.add(candidate)
                 continue
-
+            
+            ###############################################
+            # This candidate is determined to be REPLACED #
+            ###############################################
             forbidden_nodes.add(candidate)
             candidate_is_output = cl.is_output(candidate)
             replaced_positions.add(candidate)
@@ -798,6 +717,10 @@ def WSO_lock(
                )
             )
             """
+            # fanin_cone.sort(
+            #     key=lambda gate: len(set(cl.transitive_fanout(gate)) & set(cl.outputs())),
+            #     reverse=True
+            # )  # sort by number of affected outputs
 
             # plan2 PO distance
 
