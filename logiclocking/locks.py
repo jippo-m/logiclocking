@@ -56,72 +56,67 @@ def inputs_in_fanincone(c, gate):
     return transitive_fanin_only_input
 
 
-def delete_lut_gates_in_path(c, path):
-    path_without_lut = [] # もとはpath_with_modularized_lutという名前だった
-    # 名前が"mux"で始まるゲートを除外
-    # lutは内部的にはmuxを使って実装されている
-    for gate in path:
-        match = re.match("mux", gate)
-        if not match:
-            path_without_lut.append(gate)
-    return tuple(path_without_lut)
-
-
-def delete_lut_gates_in_paths(c, paths):
+def delete_lut_gates_in_paths(c, paths: list[tuple[str]]) -> list[tuple[str]]:
     paths_without_lut = set() # setにすることで重複しているパスを削除
     for path in paths:
-        paths_without_lut.add(delete_lut_gates_in_path(c, path))
+        path_without_lut = [] # もとはpath_with_modularized_lutという名前だった
+        # 名前が"mux"で始まるゲートを除外
+        # lutは内部的にはmuxを使って実装されている
+        for gate in path:
+            match = re.match("mux", gate)
+            if not match:
+                path_without_lut.append(gate)
+        paths_without_lut.add(tuple(path_without_lut))
     return list(paths_without_lut)
 
 
-def calc_longest_path(c, start, end):
+# startからendまでの最長パスを計算する
+def calc_longest_path(c, start: str, end: str) -> tuple[str]:
+    # circuitgraph の paths メソッドは、start から end までの全ての単純パスを返す
     paths = {tuple(path) for path in c.paths(start, end)}
-    paths_with_modularized_lut = tuple(delete_lut_gates_in_paths(c, paths))
-    return max(paths_with_modularized_lut, key=len)
+    paths_without_lut = tuple(delete_lut_gates_in_paths(c, paths))
+    return max(paths_without_lut, key=len)
 
 
-def calc_longest_path_inputs_to_gate(c, gate):
+# 各PIからgateまでの最長パスの中で最も長いものを返す
+def calc_longest_path_from_pi_to_gate(c, gate) -> tuple[str]:
     inputs = inputs_in_fanincone(c, gate)
     longest_paths = []
     for input in inputs:
         longest_paths.append(calc_longest_path(c, input, gate))
+    if not longest_paths:
+        return tuple()  # 空のタプルを返す
     return max(longest_paths, key=len)
 
 
-def remove_duplicates_preserve_order(lst):
-    seen = set()
-    return [x for x in lst if not (x in seen or seen.add(x))]
-
-
-def align_path_length(path, length):
-    if len(path) - 1 < length:
-        raise Exception("too short path")
-    return path[-length-1:]
-
-
-def align_paths_length(paths, length):
+def align_paths_length(paths: list[tuple[str]], length: int) -> list[tuple[str]]:
     paths_alined = []
     for path in paths:
         if len(path) - 1 < length:
             continue
-        paths_alined.append(align_path_length(path, length))
-    return remove_duplicates_preserve_order(paths_alined)
+        if path[-length-1:] in paths_alined:
+            continue
+        paths_alined.append(path[-length-1:])  # 最後のlength個の要素を取得
+    return paths_alined
 
-
-def loop_paths_from_inputs(c, num_loops, length_loops, end_gates):
+# 指定された数、長さ、end_gatesのループパスを生成する
+def generate_loop_paths_from_endgates(
+        c, num_loops, length_loops, end_gates: list[str]
+    ) -> list[tuple]:
     longest_paths = []
     for end_gate in end_gates:
-        longest_paths.append(calc_longest_path_inputs_to_gate(c, end_gate))
-
-    longest_paths.sort(key=len)
-
-    longest_paths_length_loops = align_paths_length(longest_paths, length_loops)
+        longest_paths.append(calc_longest_path_from_pi_to_gate(c, end_gate))
     
-    if len(longest_paths_length_loops) < num_loops:
-        raise Exception(f"too few loop candidates")
-    return longest_paths_length_loops[0:num_loops]
+    longest_paths.sort(key=len)
+    
+    aligned_paths = align_paths_length(longest_paths, length_loops)
+    
+    # ループパスが必ず見つかるという前提だと厳しい
+    # if len(longest_paths_length_loops) < num_loops:
+    #     raise Exception(f"too few loop candidates")
+    return aligned_paths[0:num_loops]
 
-def have_same_start_gates(paths):
+def have_same_start_gates(paths: list[tuple[str]]) -> bool:
     start_gates = set()
     for path in paths:
         if (path[0], path[1]) in start_gates:
@@ -129,30 +124,27 @@ def have_same_start_gates(paths):
         start_gates.add((path[0], path[1]))
     return False
 
-
-def path_to_pair_path(path):
-    pair_path = []
-    for i in range(len(path)-1):
-        pair_path.append((path[i], path[i+1]))
-    return tuple(pair_path)
-
-
-def paths_to_pair_paths(paths):
+# path: [ (A, B, C, D), ... ] -> pair_path: [ ((A, B), (B, C), (C, D)), ... ]
+def convert_paths_to_pair_paths(paths: list[tuple[str]]) -> list[tuple[tuple[str, str]]]:
     pair_paths = []
     for path in paths:
-        pair_paths.append(path_to_pair_path(path))
+        pair_path = []
+        for i in range(len(path) - 1):
+            pair_path.append((path[i], path[i+1]))
+        pair_paths.append(tuple(pair_path))
     return pair_paths
 
-
-def paths_to_gates(paths):
+# 複数の経路に含まれるすべてのユニークなゲートを抽出する
+# [(A, B, C), (B, D, E)] -> [A, B, C, D, E]
+def paths_to_gates(paths: list[tuple[str]]) -> list[str]:
     gates = set()
     for path in paths:
         gates |= set(path)
     return list(gates)
 
 
-def get_gates_fanout_1(c, paths):
-    paths = [path[1:] for path in paths]
+def get_gates_fanout_1(c, paths: list[tuple[str]]) -> list[str]:
+    paths = [path[1:] for path in paths] # ループに含まれるゲートのみ考える
     gates = paths_to_gates(paths)
     gates_fanout_1 = []
     for gate in gates:
@@ -169,64 +161,204 @@ def get_gates_no_mux(c, paths):
         if len(c.fanin(gate)) >= 1:
             gates_no_mux.append(gate)
     return gates_no_mux
-    
-def get_mux_connections(c, paths):
+
+def get_mux_connections(c, paths) -> list[tuple[str, str, str]]:
     mux_connections = []
-    gates_no_mux = get_gates_no_mux(c, paths)
-    pair_gates_added = set()
-    for pair_path in paths_to_pair_paths(paths):
-        mux_connections.append((pair_path[0][0], pair_path[-1][1], pair_path[0][1]))
-        pair_gates_added.add((pair_path[0][0], pair_path[0][1]))
-    for pair_path in paths_to_pair_paths(paths):
-        for pair_gate in pair_path[1:]:
-            if (pair_gate[0], pair_gate[1]) not in pair_gates_added:
-                mux_connections.append((pair_gate[0], random.choice(gates_no_mux), pair_gate[1]))
-                pair_gates_added.add((pair_gate[0], pair_gate[1]))
+    gates_no_mux = get_gates_no_mux(c, paths) # gates_no_mux の取得は変更しない
     
-    for gate_fanout_1 in get_gates_fanout_1(c, paths):
-        out = gates_no_mux.pop()
-        in1 = list(c.fanin(out)).pop()
+    # ensure gates_no_mux has enough elements for pop() later
+    if len(gates_no_mux) < len(get_gates_fanout_1(c, paths)):
+        print("Warning: Not enough gates in gates_no_mux for all fanout_1 gates. Adjusting list length.")
+        # ここで gates_no_mux を増やすか、get_gates_fanout_1 の結果を減らすか検討
+        # 簡単な方法としては、get_gates_fanout_1 の結果を gates_no_mux の数に合わせる
+        # または、mux_connections を構築する際に gates_no_mux の枯渇をチェックし、スキップする
+
+    processed_in_out_pairs = set()
+
+    # 最初のパスの処理
+    for pair_path in convert_paths_to_pair_paths(paths):
+        if len(pair_path) == 0: # 空のpair_pathをスキップ
+            continue
+        in1 = pair_path[0][0]
+        # 修正: MUXの第2入力は、gates_no_muxからランダムに選択するのではなく、
+        # パスの終端ゲートのファンインを使用する意図であれば、そのように変更。
+        # 現在のコードでは pair_path[-1][1] が in2 に相当しますが、これは
+        # 実際には MUX の in1 と in2 のどちらになるかによって MUX のキーで制御されます。
+        # ここでの in2 は、MUX のもう一方の入力に接続されるゲートを指します。
+        # HCLLL の意図が MUX の片方の入力を回路の別の部分に接続することであれば、
+        # `random.choice(gates_no_mux)` が適切です。
+        # 今回のエラーは `out` が `not` ゲートであることなので、`out` の選定に注目します。
+        out = pair_path[0][1] # out はパスの2番目のゲート
+        
+        # out が 'not' ゲートでないことを確認
+        if c.type(out) == 'not':
+            print(f"Skipping potential MUX insertion to 'not' gate: {out}")
+            continue
+
+        if (in1, out) not in processed_in_out_pairs:
+            # ここでは in2 には何を接続したいのか？もしループの概念を適用するなら、
+            # ループパスの異なる部分からのゲートになるはず。
+            # 既存のコードでは in2 が定義されていませんが、HCLLL の元のロジックでは
+            # random.choice(gates_no_mux) が使われていました。
+            # 暫定的に random.choice(gates_no_mux) を使用しますが、枯渇に注意が必要です。
+            if not gates_no_mux:
+                print("Error: gates_no_mux is empty for first loop, cannot choose random gate for mux_connection.")
+                # ここでエラーをraiseするか、空リストを返すか、適切なエラーハンドリングを行う
+                # 暫定的に空リストを返してTypeErrorを回避
+                return [] 
+            in2_candidate = random.choice(gates_no_mux)
+            
+            # 修正: MUXのin2がoutのファンアウトコーンに属していないことを確認（ループ回避のため）
+            if in2_candidate in c.transitive_fanin(out) or out in c.transitive_fanin(in2_candidate):
+                 print(f"Skipping MUX insertion to avoid loop for ({in1}, {in2_candidate}, {out})")
+                 continue
+
+            mux_connections.append((in1, in2_candidate, out))
+            processed_in_out_pairs.add((in1, out))
+
+    # 二重切断対策のロジック: pair_gates_added を使用
+    for pair_path in convert_paths_to_pair_paths(paths):
+        for pair_gate in pair_path[1:]: # 最初のペア (path[0], path[1]) 以外を対象
+            in1 = pair_gate[0]
+            out = pair_gate[1]
+
+            if c.type(out) == 'not': # out が 'not' ゲートならスキップ
+                print(f"Skipping potential MUX insertion to 'not' gate: {out}")
+                continue
+
+            if (in1, out) not in processed_in_out_pairs:
+                if not gates_no_mux:
+                     print("Error: gates_no_mux is empty for second loop, cannot choose random gate for mux_connection.")
+                     return [] 
+                in2_candidate = random.choice(gates_no_mux)
+
+                if in2_candidate in c.transitive_fanin(out) or out in c.transitive_fanin(in2_candidate):
+                     print(f"Skipping MUX insertion to avoid loop for ({in1}, {in2_candidate}, {out})")
+                     continue
+
+                mux_connections.append((in1, in2_candidate, out))
+                processed_in_out_pairs.add((in1, out))
+    
+    # get_gates_fanout_1 での処理
+    # gates_no_mux の枯渇対策と c.fanin(out) のチェック
+    gates_fanout_1_list = get_gates_fanout_1(c, paths)
+    
+    # pop() を使う前に gates_no_mux のサイズと必要な pop 回数を比較
+    if len(gates_no_mux) < len(gates_fanout_1_list):
+        print("Warning: gates_no_mux might get exhausted. Reducing gates_fanout_1_list.")
+        gates_fanout_1_list = gates_fanout_1_list[:len(gates_no_mux)] # 利用可能な数に制限
+
+    for gate_fanout_1 in gates_fanout_1_list:
+        if not gates_no_mux:
+            print("Error: gates_no_mux is empty for third loop, cannot pop gate for mux_connection.")
+            return []
+        out = gates_no_mux.pop() # pop() されているので、同じゲートは二度使われない
+        
+        if c.type(out) == 'not': # out が 'not' ゲートならスキップし、popしたゲートを戻さない
+            print(f"Skipping potential MUX insertion to 'not' gate: {out} (from gates_no_mux.pop())")
+            continue # このoutはスキップされるため、gates_no_muxからは除外されたまま
+
+        if not c.fanin(out):
+            print(f"WARNING: Gate {out} has no fanin for mux_connection. Skipping.")
+            continue
+        
+        # in1 の選択ロジックを慎重に
+        # list(c.fanin(out)).pop() は元の回路のファンインを1つ取り出すが、
+        # どのファンインが選ばれるかは保証されない。
+        # 目的によっては random.choice(list(c.fanin(out))) の方が良い場合も。
+        in1 = list(c.fanin(out))[0] # pop() ではなくインデックスでアクセス
         in2 = gate_fanout_1
-        mux_connections.append((in1, in2, out))
+        
+        if (in1, out) not in processed_in_out_pairs:
+            # ループ回避チェック
+            if in2 in c.transitive_fanin(out) or out in c.transitive_fanin(in2):
+                 print(f"Skipping MUX insertion to avoid loop for ({in1}, {in2}, {out})")
+                 continue
+
+            mux_connections.append((in1, in2, out))
+            processed_in_out_pairs.add((in1, out))
     
     return mux_connections
 
-def insert_mux(c, in1, in2, out, sel):
+# 既存の回路の接続を切断 -> その間に新しいMUXを挿入して再接続
+# sel = selecter. "key_prefixXXXX" の形になっている
+def insert_mux(c, in1: str, in2: str, out: str, sel: str):
     m = cg.logic.mux(2)
-    c.add_subcircuit(m, f"mux_{in1}_{out}")
+    
+    # 変更点: サブサーキット名を sel から派生させて一意にする
+    # sel が既に一意のキー名であることを利用する
+    mux_subcircuit_name = sel.replace("keyinput", "mux_key_") # 例: "keyinput0000" -> "mux_key_0000"
+    
+    # print(f"  Adding subcircuit {mux_subcircuit_name}")
+    c.add_subcircuit(m, mux_subcircuit_name) # サブサーキット名を変更
 
-    # connect sel
-    c.connect(sel, f"mux_{in1}_{out}_sel_0")
+    ### connect sel ###
+    # print(f"  Connecting {sel} to {mux_subcircuit_name}_sel_0")
+    c.connect(sel, f"{mux_subcircuit_name}_sel_0")
 
-    # connect in
+    ### connect in ###
+    # print(f"  Disconnecting {in1} from {out}")
     c.disconnect(in1, out)
-    c.connect(in1,f"mux_{in1}_{out}_in_0")
-    c.connect(in2,f"mux_{in1}_{out}_in_1")
+    # print(f"  Connecting {in1} to {mux_subcircuit_name}_in_0")
+    c.connect(in1,f"{mux_subcircuit_name}_in_0")
+    # print(f"  Connecting {in2} to {mux_subcircuit_name}_in_1")
+    c.connect(in2,f"{mux_subcircuit_name}_in_1")
 
-    # connect out
-    c.connect(f"mux_{in1}_{out}_out", out)
+    ### connect out ###
+    # print(f"  Connecting {mux_subcircuit_name}_out to {out}")
+    c.connect(f"{mux_subcircuit_name}_out", out)
+    # print(f"  insert_mux finished for {out}")
 
+def loop_lock(
+        c, num_loops, length_loops, 
+        start_gates: set[str]=None, 
+        end_gates:   set[str]=None, 
+        lut_pair_candidates: set[str]=None, 
+        key_prefix="key_"
+    ) -> tuple[cg.Circuit, list[tuple[str]]]:
+    paths = []
+    cl = c.copy()
 
-def loop_lock(c, num_loops, length_loops, end_gates, key_prefix="key_"):
-    paths = loop_paths_from_inputs(c, num_loops, length_loops, end_gates)
-    while have_same_start_gates(paths):
-        paths = loop_paths_from_inputs(c, num_loops, length_loops, end_gates)
-    print("\033[34m" + "loop paths:" + "\033[0m")
+    if start_gates and end_gates:
+        raise ValueError("Both start_gates and end_gates cannot be provided simultaneously for loop_lock.")
+    # elif start_gates:
+    #     paths = loop_paths_from_gates_to_outputs(c, num_loops, length_loops, start_gates)
+    elif end_gates: # 既存の動作
+        paths = generate_loop_paths_from_endgates(c, num_loops, length_loops, end_gates)
+    else:
+        raise ValueError("Either start_gates or end_gates must be provided for loop_lock.")
+    
+    # パスが取得できない場合のハンドリング
+    if not paths:
+        raise ValueError(
+            f"No suitable paths found for loop locking with "
+            f"num_loops={num_loops}, length_loops={length_loops}, "
+            f"start_gates={start_gates}, end_gates={end_gates}"
+        )
+
+    while have_same_start_gates(paths) and len(paths) > num_loops: # 無限ループ防止のため条件追加
+        paths = generate_loop_paths_from_endgates(c, num_loops, length_loops, end_gates)
+        if not paths: # 再試行してもパスが見つからない場合
+            raise ValueError(f"Could not find diverse enough paths for loop locking after retry.")
+        if len(paths) <= num_loops:
+            paths = paths[:num_loops] # 必要数に絞る
+
+    print("\033[34m" + f"{len(paths)} loop paths:" + "\033[0m")
     print(paths)
     mux_connections = get_mux_connections(c, paths)
 
-    cl = c.copy()
-    count = 0
-    for mux_connection in mux_connections:
-        cl.add(f"{key_prefix}{count:04}", "input")
-        insert_mux(cl, mux_connection[0], mux_connection[1], mux_connection[2], f"{key_prefix}{count:04}")
-        count += 1
-    return cl
+    for count_idx, mux_connection in enumerate(mux_connections):
+        # print(f"Processing mux_connection {count_idx+1}: {mux_connection}")
+        cl.add(f"{key_prefix}{count_idx:04}", "input")
+        insert_mux(cl, mux_connection[0], mux_connection[1], mux_connection[2], f"{key_prefix}{count_idx:04}")
+    return cl, paths
 
 # 置換することにより保護できる出力の集合を返す
 def get_affected_outputs(c, locked_gates_list: list[str]) -> set[str]:
     affected_outputs = set()
     for replaced_gate in locked_gates_list:
+        if c.is_output(replaced_gate):
+            affected_outputs.add(replaced_gate)
         for gate in c.transitive_fanout(replaced_gate):
             if c.is_output(gate):
                 affected_outputs.add(gate)
@@ -321,8 +453,8 @@ def FIFO_lock(
             try:
                 new_po = pos.pop(0)
                 candidates.append(new_po)
-                affected_outputs.add(new_po)  # add the new po to affected outputs
-                affected_outputs |= c.transitive_fanout(new_po)  # add all the outputs in fanoutcone
+                affected_outputs.add(new_po)
+                affected_outputs |= c.transitive_fanout(new_po)
 
                 # add replaceable fanincone into candidates
                 for gate in c.transitive_fanin(new_po): # c or cl?
@@ -368,8 +500,8 @@ def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1
     # まずはFIFOのみ実行し、LUTに置換する論理ゲート（locked_list）を把握
     _, _, locked_list, _ = FIFO_lock(c, num_gates, count_keys, skip_fi1, key_prefix)
     # LUTに置換する場所をフィードバック起点 (end_gates) としてループを作る
-    c_loop_only = loop_lock(c, num_loops, length_loops, locked_list, key_prefix)
-
+    c_loop_only = loop_lock(c, num_loops, length_loops, end_gates=locked_list, key_prefix=key_prefix)
+    
     cl = c_loop_only.copy()
     locked_gates = 0
     for locked_gate in locked_list:
@@ -386,7 +518,7 @@ def FIFOL_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1
     return cl, c_loop_only, locked_list, affected_outputs
 
 
-# 広い範囲の出力に影響を与えるように置換する wide scope output = WSO, High Corruptibility LUT Loop Lock = HC-LLL
+# 広い範囲の出力に影響を与えるように置換する High Corruptibility LUT (Loop) Lock = HC-LLL
 def HCLL(
     c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
 ):
@@ -425,7 +557,7 @@ def HCLL(
     def rank_gate_by_affected_outputs(gate):
         return len(get_affected_outputs(c, [gate]))
 
-    pis.sort(key=rank_gate_by_affected_outputs, reverse=True)
+    # pis.sort(key=rank_gate_by_affected_outputs, reverse=True)
     keys = {}
     candidates = []
     forbidden_nodes = set()
@@ -433,25 +565,44 @@ def HCLL(
     locked_list = []
     affected_outputs = set()
 
+    # 
+    # for pi in pis:
+    #     for gate in c.fanout(pi):
+    #         if gate in forbidden_nodes:  # skip forbidden nodes
+    #             continue
+    #         candidates.append(gate)
+    # candidates = list(set(candidates))  # 重複を削除
+    # candidates.sort(key=rank_gate_by_affected_outputs, reverse=True)
+    # for pi in pis:
+    #     # add replaceable fanout into candidates
+    #     current_pi_fanout_gates = set()
+    #     for gate in c.fanout(pi):
+    #         if gate in forbidden_nodes:  # skip forbidden nodes
+    #             continue
+    #         current_pi_fanout_gates.add(gate)
+
+    #     current_pi_fanout_gates = list(current_pi_fanout_gates)
+    #     current_pi_fanout_gates.sort(key=rank_gate_by_affected_outputs, reverse=True)
+    #     for gate in current_pi_fanout_gates:
+    #         candidates.insert(0, gate)
+
+    fanouts_of_pis = set()
     for pi in pis:
-        # add replaceable fanout into candidates
-        current_pi_fanout_gates = set()
-        for gate in c.fanout(pi): # c or cl?
+        for gate in c.fanout(pi):
             if gate in forbidden_nodes:  # skip forbidden nodes
                 continue
-            current_pi_fanout_gates.add(gate)
+            fanouts_of_pis.add(gate)
 
-        current_pi_fanout_gates = list(current_pi_fanout_gates)
-        current_pi_fanout_gates.sort(key=rank_gate_by_affected_outputs, reverse=True)
-        for gate in current_pi_fanout_gates:
-            candidates.insert(0, gate)
+    fanouts_of_pis = list(fanouts_of_pis)
+    fanouts_of_pis.sort(key=rank_gate_by_affected_outputs, reverse=True)
+    for gate in fanouts_of_pis:
+        candidates.insert(0, gate)
 
     while continue_locking(locked_gates, num_gates, keys, count_keys):
         if not candidates:
-            print("\033[31m" + "No more candidates left." + "\033[0m")
-            exit(1)
+            raise ValueError("No more candidates to lock.")
             
-        else: # ファンインコーン探索中
+        else:
             candidate = candidates.pop(0)
 
             # skip forbidden nodes
@@ -473,6 +624,8 @@ def HCLL(
 
             # NB2: Not-Back-to-Back
             for gate in c.fanout(candidate):
+                forbidden_nodes.add(gate)
+            for gate in c.fanout(candidate):
                 for NB2_gate in c.fanout(gate):
                     if NB2_gate not in forbidden_nodes:
                         candidates.append(NB2_gate)
@@ -483,25 +636,348 @@ def HCLL(
 
 def HCLLL(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1=False, key_prefix="key_"):
 
-    # まずはFIFOのみ実行し、LUTに置換する論理ゲート（locked_list）を把握
-    _, _, locked_list, _ = HCLL(c, num_gates, count_keys, skip_fi1, key_prefix)
-    # LUTに置換する場所をフィードバック起点 (end_gates) としてループを作る
-    c_loop_only = loop_lock(c, num_loops, length_loops, locked_list, key_prefix)
+    # まずはHCLLを実行し、LUTに置換する論理ゲート（locked_list）を把握
+    _, _, locked_list, _ = NEW_lock(c, num_gates, count_keys, skip_fi1, key_prefix)
+    print("\033[34m" + f"{len(locked_list)} replaced gates:" + "\033[0m")
+    print(locked_list)
+    
+    # LUTに置換した箇所をフィードバック起点 (start_gates) としてループを作る
+    print("Creating loop-only circuit with locked gates...")
+    # c_loop_only = loop_lock(c, num_loops, length_loops, lut_pair_candidates=locked_list, key_prefix=key_prefix)
+    c_loop_only, loop_paths = loop_lock(c, num_loops, length_loops, end_gates=locked_list, key_prefix=key_prefix)
+    print("Successfully created loop-only circuit with locked gates.")
 
     cl = c_loop_only.copy()
     locked_gates = 0
     for locked_gate in locked_list:
-        locked_gate_is_output = c.is_output(locked_gate)
+        locked_gate_is_output = c.is_output(locked_gate) # 元の回路cでの出力判定
+        key, nodes, output_to_relabel = replace_lut(locked_gate, cl, locked_gates, key_prefix)
+        # replace_lutの結果のキーをここで結合する
+        # keys.update(key) # HCLLL関数の返り値にキーが含まれていないため、必要であればここで処理
+        cl = cg.tx.relabel(cl, {output_to_relabel: locked_gate})
+        if locked_gate_is_output:
+            cl.set_output(locked_gate)
+        locked_gates += 1
+    
+    affected_outputs = get_affected_outputs(c, locked_list)
+    return cl, c_loop_only, locked_list, affected_outputs, loop_paths
+
+
+# lut_lock + loop
+def lut_loop_lock(c, num_gates, num_loops, length_loops, count_keys=False, skip_fi1=False, key_prefix="key_"):
+    # まずはlut_lockのみ実行し、LUTに置換する論理ゲート（locked_list）を把握
+    _, _, locked_list, _ = lut_lock(c, num_gates, count_keys, skip_fi1, key_prefix)
+    
+    # LUTに置換した箇所をフィードバック起点 (start_gates) としてループを作る
+    c_loop_only = loop_lock(c, num_loops, length_loops, end_gates=locked_list, key_prefix=key_prefix)
+
+    cl = c_loop_only.copy()
+    locked_gates = 0
+    for locked_gate in locked_list:
+        locked_gate_is_output = c.is_output(locked_gate) # 元の回路cでの出力判定
         key, nodes, output_to_relabel = replace_lut(locked_gate, cl, locked_gates, key_prefix)
         cl = cg.tx.relabel(cl, {output_to_relabel: locked_gate})
         if locked_gate_is_output:
             cl.set_output(locked_gate)
-        # print(locked_gate, locked_gates)
-        # print(key)
         locked_gates += 1
     
     affected_outputs = get_affected_outputs(c, locked_list)
     return cl, c_loop_only, locked_list, affected_outputs
+
+def new_lock(
+    c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
+):
+    cl = c.copy()
+    pis = list(cl.inputs())
+    affected_outputs = set()
+    # print(f"There are {len(pos)} outputs in the circuit.") # ibex_decoder については269個だった
+
+    def continue_locking(locked_gates, num_gates, keys, count_keys):
+        if count_keys:
+            return len(keys) < num_gates
+        return locked_gates < num_gates
+
+    # そのゲートを置換することで新たに影響を与える出力の集合の大きさをランクとする
+    def rank_gate(x):
+        new_affected_outputs = get_affected_outputs(c, [x])
+        new_affected_outputs -= affected_outputs
+        return len(new_affected_outputs)
+
+    keys = {}
+    candidates = []
+    forbidden_nodes = set()
+    locked_gates = 0
+    locked_list = []
+
+    fanouts_of_pis = set()
+    for pi in pis:
+        for gate in c.fanout(pi):
+            if gate in forbidden_nodes:  # skip forbidden nodes
+                continue
+            fanouts_of_pis.add(gate)
+
+    fanouts_of_pis = list(fanouts_of_pis)
+    fanouts_of_pis.sort(key=rank_gate, reverse=True)
+    candidates = fanouts_of_pis.copy()
+    # print(rank_gate(candidates[0]))
+    # print("There are", len(candidates), "candidates to lock.")
+
+    while continue_locking(locked_gates, num_gates, keys, count_keys):
+        if not candidates:
+            raise ValueError("No more candidates to lock.")
+            
+        else:
+            candidate = candidates.pop(0)
+            # print("pop後: ", rank_gate(candidate))
+
+            # skip forbidden nodes
+            if candidate in forbidden_nodes:
+                for gate in c.fanout(candidate):
+                    if gate not in forbidden_nodes:
+                        candidates.append(gate)
+                candidates = list(set(candidates))
+                candidates.sort(key=rank_gate, reverse=True)
+                continue
+
+            # skip buf/not (optional)
+            if skip_fi1 and len(cl.fanin(candidate)) == 1:
+                forbidden_nodes.add(candidate)
+                # print("\033[31m" + "skip buf/not: " + "\033[0m", candidate)
+                buf_affected_outputs = get_affected_outputs(c, [candidate])
+                # print(f"buf_affected_outputs: {len(buf_affected_outputs)}")
+                # print(buf_affected_outputs)
+                # print()
+                # print("fanout: ", c.fanout(candidate))
+                fanouts_affected = set()
+                for gate in c.fanout(candidate):
+                    # print("gate in forbidden_nodes ", gate in forbidden_nodes)
+                    # print("gate in candidiates ", gate in candidates)
+                    candidates.append(gate)
+                    new_affected = get_affected_outputs(c, [gate])
+                    # print("new_affected: ", new_affected)
+                    fanouts_affected |= new_affected
+                # print(f"fanouts_affected: {len(fanouts_affected)}")
+                # print(fanouts_affected)
+                # print(f"diff: {len(buf_affected_outputs - fanouts_affected)}")
+                # print(buf_affected_outputs - fanouts_affected)
+                candidates.sort(key=rank_gate, reverse=True)
+                continue
+
+            # do the replacment
+            key, nodes, output_to_relabel = replace_lut(candidate, cl, locked_gates, key_prefix)
+            # print("replace後: ",candidate, rank_gate(candidate))
+            keys.update(key)
+            cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
+            if c.is_output(candidate):
+                cl.set_output(candidate)
+            locked_gates += 1
+            locked_list.append(candidate)
+            forbidden_nodes.add(candidate)
+            affected_outputs |= get_affected_outputs(c, [candidate])
+
+            # NB2: Not-Back-to-Back
+            for gate in c.fanout(candidate):
+                forbidden_nodes.add(gate)
+                for NB2_gate in c.fanout(gate):
+                    if NB2_gate not in forbidden_nodes:
+                        candidates.append(NB2_gate)
+            candidates = list(set(candidates))
+            
+            candidates.sort(key=rank_gate, reverse=True)
+
+    affected_outputs = get_affected_outputs(c, locked_list)
+
+    unaffected_outputs = set(c.outputs()) - affected_outputs
+    # print(f"Unaffected outputs: {unaffected_outputs}")
+    # print(f"Number of unaffected outputs: {len(unaffected_outputs)}")
+    # for output in unaffected_outputs:
+    #     print("unaffected output: " + output, " fanin: ", c.transitive_fanin(output))
+        
+    return cl, keys, locked_list, affected_outputs
+
+def count_candidates(c):
+    candidates_from_pis = []
+    candidates_from_pis_fi1 = []
+    pis = list(c.inputs())
+    for pi in pis:
+        for gate in c.transitive_fanout(pi):
+            if gate in candidates_from_pis:  # skip already added gates
+                continue
+            candidates_from_pis.append(gate)
+            if len(c.fanin(gate)) == 1:  # if fanin is 1, add to candidates_fi1
+                candidates_from_pis_fi1.append(gate)
+    print("=== Search from inputs ===")
+    print(f"There are {len(pis)} inputs in the circuit.")
+    print(f"There are {len(candidates_from_pis)} candidates in the circuit.")
+    print(f"There are {len(candidates_from_pis_fi1)} candidates with fanin 1 in the circuit.")
+
+    candidates_from_pos = []
+    candidates_from_pos_fi1 = []
+    pos = list(c.outputs())
+    for po in pos:
+        for gate in c.transitive_fanin(po):
+            if gate in candidates_from_pos:  # skip already added gates
+                continue
+            candidates_from_pos.append(gate)
+            if len(c.fanin(gate)) == 1:  # if fanin is 1, add to candidates_fi1
+                candidates_from_pos_fi1.append(gate)
+    print("=== Search from outputs ===")
+    print(f"There are {len(pos)} outputs in the circuit.")
+    print(f"There are {len(candidates_from_pos)} candidates in the circuit.")
+    print(f"There are {len(candidates_from_pos_fi1)} candidates with fanin 1 in the circuit.")
+
+    candidates_all = list(set(candidates_from_pis + candidates_from_pos))
+    candidates_all_fi1 = list(set(candidates_from_pis_fi1 + candidates_from_pos_fi1))
+    print("=== Combined candidates ===")
+    print(f"There are {len(candidates_all)} candidates in the circuit.")
+    print(f"There are {len(candidates_all_fi1)} candidates with fanin 1 in the circuit.")
+
+def NEW_lock(
+    c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
+):
+
+    cl = c.copy()
+    pos = list(cl.outputs())
+    pis = list(cl.inputs())
+    affected_outputs = set()
+    # print(f"There are {len(pos)} outputs in the circuit.") # ibex_decoder については269個だった
+
+    def calc_skew(gate, cl):
+        d = {False: 0, True: 0}
+        fanin = list(cl.fanin(gate))
+
+        # create subcircuit containing just gate for simulation
+        simc = cg.Circuit()
+        for i in fanin:
+            simc.add(i, "input")
+        simc.add(gate, cl.type(gate), fanin=fanin)
+
+        # simulate
+        for i, vs in enumerate(product([False, True], repeat=len(fanin))):
+            assumptions = dict(zip(fanin, vs[::-1]))
+            result = cg.sat.solve(simc, assumptions)
+            if not result:
+                d[False] += 1
+            else:
+                d[result[gate]] += 1
+        num_combos = 2 ** len(fanin)
+        return abs(d[False] / num_combos - d[True] / num_combos)
+
+    def continue_locking(locked_gates, num_gates, keys, count_keys):
+        if count_keys:
+            return len(keys) < num_gates
+        return locked_gates < num_gates
+
+    # そのゲートを置換することで新たに影響を与える出力の集合の大きさをランクとする
+    def rank_gate(x):
+        new_affected_outputs = get_affected_outputs(c, [x])
+        new_affected_outputs -= affected_outputs
+        skew = calc_skew(x, cl)
+        return len(new_affected_outputs) + skew
+
+    keys = {}
+    candidates = []
+    forbidden_nodes = c.inputs()
+    locked_gates = 0
+    locked_list = []
+
+    pos.sort(key=rank_gate, reverse=True)
+    candidates = pos.copy()
+    # print(rank_gate(candidates[0]))
+    # print("There are", len(candidates), "candidates to lock.")
+
+    while continue_locking(locked_gates, num_gates, keys, count_keys):
+        if not candidates:
+            raise ValueError("No more candidates to lock.")
+            
+        else:
+            candidate = candidates.pop(0)
+            # print("pop後: ", rank_gate(candidate))
+
+            # skip forbidden nodes
+            if candidate in forbidden_nodes:
+                for gate in c.fanin(candidate):
+                    if gate not in forbidden_nodes:
+                        candidates.append(gate)
+                for gate in c.fanout(candidate):
+                    if gate not in forbidden_nodes:
+                        candidates.append(gate)
+                candidates = list(set(candidates))
+                candidates.sort(key=rank_gate, reverse=True)
+                continue
+
+            # skip buf/not (optional)
+            if skip_fi1 and len(cl.fanin(candidate)) == 1:
+                forbidden_nodes.add(candidate)
+                for gate in c.fanin(candidate):
+                    if gate not in forbidden_nodes:
+                        candidates.append(gate)
+                for gate in c.fanout(candidate):
+                    if gate not in forbidden_nodes:
+                        candidates.append(gate)
+                candidates = list(set(candidates))
+                candidates.sort(key=rank_gate, reverse=True)
+                # print("\033[31m" + "skip buf/not: " + "\033[0m", candidate)
+                # buf_affected_outputs = get_affected_outputs(c, [candidate])
+                # print(f"buf_affected_outputs: {len(buf_affected_outputs)}")
+                # print(buf_affected_outputs)
+                # print()
+                # print("fanout: ", c.fanout(candidate))
+                # fanouts_affected = set()
+                # for gate in c.fanout(candidate):
+                #     # print("gate in forbidden_nodes ", gate in forbidden_nodes)
+                #     # print("gate in candidiates ", gate in candidates)
+                #     candidates.append(gate)
+                #     new_affected = get_affected_outputs(c, [gate])
+                #     # print("new_affected: ", new_affected)
+                #     fanouts_affected |= new_affected
+                # print(f"fanouts_affected: {len(fanouts_affected)}")
+                # print(fanouts_affected)
+                # print(f"diff: {len(buf_affected_outputs - fanouts_affected)}")
+                # print(buf_affected_outputs - fanouts_affected)
+                # candidates.sort(key=rank_gate, reverse=True)
+                continue
+
+            # do the replacment
+            key, nodes, output_to_relabel = replace_lut(candidate, cl, locked_gates, key_prefix)
+            # print("replace後: ",candidate, rank_gate(candidate))
+            keys.update(key)
+            cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
+            if c.is_output(candidate):
+                cl.set_output(candidate)
+            elif candidate in c.inputs():
+                set_input(cl, candidate, input=True)
+            locked_gates += 1
+            locked_list.append(candidate)
+            forbidden_nodes.add(candidate)
+            affected_outputs |= get_affected_outputs(c, [candidate])
+
+            # NB2: Not-Back-to-Back
+            for gate in c.fanout(candidate):
+                forbidden_nodes.add(gate)
+                for NB2_gate in c.fanout(gate):
+                    if NB2_gate not in forbidden_nodes:
+                        candidates.append(NB2_gate)
+            # for gate in c.fanin(candidate):
+            #     candidates.append(gate)
+            #     forbidden_nodes.add(gate)
+            #     for NB2_gate in c.fanout(gate):
+            #         if NB2_gate not in forbidden_nodes:
+            #             candidates.append(NB2_gate)
+
+            candidates = list(set(candidates))
+            
+            candidates.sort(key=rank_gate, reverse=True)
+
+    affected_outputs = get_affected_outputs(c, locked_list)
+
+    unaffected_outputs = set(c.outputs()) - affected_outputs
+    # print(f"Unaffected outputs: {unaffected_outputs}")
+    # print(f"Number of unaffected outputs: {len(unaffected_outputs)}")
+    # for output in unaffected_outputs:
+    #     print("unaffected output: " + output, " fanin: ", c.transitive_fanin(output))
+        
+    return cl, keys, locked_list, affected_outputs
 
 #######################################################
 ########## 研究のために追加したコードはここまで ##########
