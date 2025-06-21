@@ -103,18 +103,33 @@ def align_paths_length(paths: list[tuple[str]], length: int) -> list[tuple[str]]
 def generate_loop_paths_from_endgates(
         c, num_loops, length_loops, end_gates: list[str]
     ) -> list[tuple]:
-    longest_paths = []
+    all_longest_paths = []
     for end_gate in end_gates:
-        longest_paths.append(calc_longest_path_from_pi_to_gate(c, end_gate))
+        all_longest_paths.append(calc_longest_path_from_pi_to_gate(c, end_gate))
     
-    longest_paths.sort(key=len)
+    # 長さでソート
+    all_longest_paths.sort(key=len)
     
-    aligned_paths = align_paths_length(longest_paths, length_loops)
+    # 長さの条件を満たすパスに絞り込む
+    aligned_paths = align_paths_length(all_longest_paths, length_loops)
     
-    # ループパスが必ず見つかるという前提だと厳しい
-    # if len(longest_paths_length_loops) < num_loops:
-    #     raise Exception(f"too few loop candidates")
-    return aligned_paths[0:num_loops]
+    selected_paths = []
+    selected_start_gate_pairs = set()
+
+    for path in aligned_paths:
+        if len(selected_paths) >= num_loops:
+            break
+        
+        # パスが十分な長さを持つことを確認
+        if len(path) < length_loops + 1: # pathの長さがlength_loopsより1大きい必要がある（例：長さ2なら3つのゲート）
+            continue
+
+        current_start_gate_pair = (path[0], path[1])
+        if current_start_gate_pair not in selected_start_gate_pairs:
+            selected_paths.append(path)
+            selected_start_gate_pairs.add(current_start_gate_pair)
+    
+    return selected_paths
 
 def have_same_start_gates(paths: list[tuple[str]]) -> bool:
     start_gates = set()
@@ -796,38 +811,42 @@ def new_lock(
     return cl, keys, locked_list, affected_outputs
 
 def count_candidates(c):
-    candidates_from_pis = []
-    candidates_from_pis_fi1 = []
+    candidates_from_pis = set()
+    candidates_from_pis_fi1 = set()
+    po_from_pis = set()
     pis = list(c.inputs())
     for pi in pis:
         for gate in c.transitive_fanout(pi):
-            if gate in candidates_from_pis:  # skip already added gates
-                continue
-            candidates_from_pis.append(gate)
+            candidates_from_pis.add(gate)
             if len(c.fanin(gate)) == 1:  # if fanin is 1, add to candidates_fi1
-                candidates_from_pis_fi1.append(gate)
+                candidates_from_pis_fi1.add(gate)
+            if c.is_output(gate):
+                po_from_pis.add(gate)
     print("=== Search from inputs ===")
     print(f"There are {len(pis)} inputs in the circuit.")
     print(f"There are {len(candidates_from_pis)} candidates in the circuit.")
     print(f"There are {len(candidates_from_pis_fi1)} candidates with fanin 1 in the circuit.")
+    print(f"There are {len(po_from_pis)} outputs from inputs in the circuit.")
 
-    candidates_from_pos = []
-    candidates_from_pos_fi1 = []
+    candidates_from_pos = set()
+    candidates_from_pos_fi1 = set()
+    pi_from_pos = set()
     pos = list(c.outputs())
     for po in pos:
         for gate in c.transitive_fanin(po):
-            if gate in candidates_from_pos:  # skip already added gates
-                continue
-            candidates_from_pos.append(gate)
+            candidates_from_pos.add(gate)
             if len(c.fanin(gate)) == 1:  # if fanin is 1, add to candidates_fi1
-                candidates_from_pos_fi1.append(gate)
+                candidates_from_pos_fi1.add(gate)
+            if gate in pis:
+                pi_from_pos.add(gate)
     print("=== Search from outputs ===")
     print(f"There are {len(pos)} outputs in the circuit.")
     print(f"There are {len(candidates_from_pos)} candidates in the circuit.")
     print(f"There are {len(candidates_from_pos_fi1)} candidates with fanin 1 in the circuit.")
+    print(f"There are {len(pi_from_pos)} inputs from outputs in the circuit.")
 
-    candidates_all = list(set(candidates_from_pis + candidates_from_pos))
-    candidates_all_fi1 = list(set(candidates_from_pis_fi1 + candidates_from_pos_fi1))
+    candidates_all = candidates_from_pis | candidates_from_pos
+    candidates_all_fi1 = candidates_from_pis_fi1 | candidates_from_pos_fi1
     print("=== Combined candidates ===")
     print(f"There are {len(candidates_all)} candidates in the circuit.")
     print(f"There are {len(candidates_all_fi1)} candidates with fanin 1 in the circuit.")
@@ -835,7 +854,6 @@ def count_candidates(c):
 def NEW_lock(
     c, num_gates, count_keys=False, skip_fi1=False, key_prefix="key_"
 ):
-
     cl = c.copy()
     pos = list(cl.outputs())
     pis = list(cl.inputs())
@@ -917,25 +935,6 @@ def NEW_lock(
                         candidates.append(gate)
                 candidates = list(set(candidates))
                 candidates.sort(key=rank_gate, reverse=True)
-                # print("\033[31m" + "skip buf/not: " + "\033[0m", candidate)
-                # buf_affected_outputs = get_affected_outputs(c, [candidate])
-                # print(f"buf_affected_outputs: {len(buf_affected_outputs)}")
-                # print(buf_affected_outputs)
-                # print()
-                # print("fanout: ", c.fanout(candidate))
-                # fanouts_affected = set()
-                # for gate in c.fanout(candidate):
-                #     # print("gate in forbidden_nodes ", gate in forbidden_nodes)
-                #     # print("gate in candidiates ", gate in candidates)
-                #     candidates.append(gate)
-                #     new_affected = get_affected_outputs(c, [gate])
-                #     # print("new_affected: ", new_affected)
-                #     fanouts_affected |= new_affected
-                # print(f"fanouts_affected: {len(fanouts_affected)}")
-                # print(fanouts_affected)
-                # print(f"diff: {len(buf_affected_outputs - fanouts_affected)}")
-                # print(buf_affected_outputs - fanouts_affected)
-                # candidates.sort(key=rank_gate, reverse=True)
                 continue
 
             # do the replacment
@@ -945,8 +944,6 @@ def NEW_lock(
             cl = cg.tx.relabel(cl, {output_to_relabel: candidate})
             if c.is_output(candidate):
                 cl.set_output(candidate)
-            elif candidate in c.inputs():
-                set_input(cl, candidate, input=True)
             locked_gates += 1
             locked_list.append(candidate)
             forbidden_nodes.add(candidate)
